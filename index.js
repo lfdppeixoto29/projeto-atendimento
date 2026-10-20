@@ -1,12 +1,13 @@
 const express = require('express');
-const fetch = require('node-fetch');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
+const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-require('dotenv').config();
+// Usa o fetch nativo do Node (18+). Sem dependencia externa.
+const fetch = globalThis.fetch;
 
 const app = express();
 app.use(express.json());
@@ -21,6 +22,7 @@ if (!fs.existsSync(SESSIONS_DIR)) {
 // Instância única do WhatsApp (direto via Baileys)
 let sock = null;
 let whatsappStatus = 'Iniciando conexão...';
+let latestQR = '';
 
 // Armazenamento de estados dos clientes
 const userStates = new Map();
@@ -164,7 +166,6 @@ async function startWhatsApp() {
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
     logger: pino({ level: 'silent' })
   });
 
@@ -172,6 +173,12 @@ async function startWhatsApp() {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      latestQR = qr;
+      whatsappStatus = 'Aguardando leitura do QR Code...';
+      console.log('[QR] Novo QR Code gerado. Abra a pagina web para escanear.');
+    }
 
     if (connection === 'close') {
       const shouldReconnect = (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut);
@@ -184,6 +191,7 @@ async function startWhatsApp() {
       }
     } else if (connection === 'open') {
       whatsappStatus = 'Conectado com sucesso ao WhatsApp! 🟢';
+      latestQR = '';
       console.log('[CONEXÃO] WhatsApp conectado com sucesso!');
     }
   });
@@ -210,7 +218,17 @@ async function startWhatsApp() {
   });
 }
 
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
+  let qrHtml = '';
+  if (latestQR) {
+    try {
+      const qrImage = await qrcode.toDataURL(latestQR, { margin: 1, width: 260 });
+      qrHtml = `<img src="${qrImage}" alt="QR Code WhatsApp" style="background:#fff;padding:10px;border-radius:8px;margin-top:15px;" />`;
+    } catch (e) {
+      qrHtml = '<p>Erro ao gerar imagem do QR Code.</p>';
+    }
+  }
+
   res.send(`
     <html>
       <head>
@@ -218,16 +236,19 @@ app.get('/', (req, res) => {
         <meta http-equiv="refresh" content="5">
         <title>Atendimento WhatsApp - Status</title>
         <style>
-          body { font-family: sans-serif; background: #0f172a; color: #fff; text-align: center; padding-top: 80px; }
+          body { font-family: sans-serif; background: #0f172a; color: #fff; text-align: center; padding-top: 60px; }
           .box { background: #1e293b; display: inline-block; padding: 30px 60px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
           h1 { color: #38bdf8; font-size: 1.4em; }
           p { color: ${whatsappStatus.includes('Conectado') ? '#22c55e' : '#fbbf24'}; font-weight: bold; font-size: 1.1em; }
+          small { color: #94a3b8; }
         </style>
       </head>
       <body>
         <div class="box">
           <h1>🤖 Atendimento WhatsApp Online</h1>
           <p>${whatsappStatus}</p>
+          ${qrHtml}
+          ${latestQR ? '<small>WhatsApp &gt; Aparelhos conectados &gt; Conectar aparelho</small>' : ''}
         </div>
       </body>
     </html>
