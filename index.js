@@ -1,20 +1,31 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
-const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
-const INSTANCE_NAME = process.env.INSTANCE_NAME || 'atendimento_principal';
 
-// Armazenamento em memória dos estados dos clientes
-// remoteJid -> { mode: 'INICIAL' | 'COLETANDO_DADOS' | 'EMPRESA_MENU' | 'PARTICULAR' }
+const SESSIONS_DIR = path.join(__dirname, 'sessions');
+if (!fs.existsSync(SESSIONS_DIR)) {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+}
+
+// Instância única do WhatsApp (direto via Baileys)
+let sock = null;
+let whatsappStatus = 'Iniciando conexão...';
+
+// Armazenamento de estados dos clientes
 const userStates = new Map();
 
-// Configurações do Atendimento
+// Configurações
 const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || "",
   aiPrompt: "Você é um assistente virtual prestativo e educado. Responda de forma clara e objetiva.",
@@ -37,29 +48,6 @@ const config = {
   particularIntro: "🤖 *Atendimento Particular ativado!* A partir de agora nossa Inteligência Artificial vai conversar com você."
 };
 
-// Função para enviar mensagem via Evolution API
-async function sendWhatsAppMessage(number, text) {
-  try {
-    const url = `${EVOLUTION_API_URL}/message/sendText/${INSTANCE_NAME}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': EVOLUTION_API_KEY
-      },
-      body: JSON.stringify({
-        number: number.replace('@s.whatsapp.net', ''),
-        text: text
-      })
-    });
-    const data = await response.json();
-    console.log(`[ENVIO] Mensagem enviada para ${number}:`, data);
-  } catch (err) {
-    console.error(`[ERRO ENVIO] Falha ao enviar para ${number}:`, err.message);
-  }
-}
-
-// Função para chamar a IA (OpenAI GPT)
 async function askAI(userMessage) {
   if (!config.openaiApiKey) return "⚠️ Chave da API OpenAI não configurada no servidor.";
   try {
@@ -86,127 +74,167 @@ async function askAI(userMessage) {
   }
 }
 
-// Rota de Webhook para receber mensagens da Evolution API
-app.post('/webhook', async (req, res) => {
-  try {
-    const body = req.body;
-    console.log('[WEBHOOK RECEBIDO]', JSON.stringify(body, null, 2));
+async function handleIncomingMessage(remoteJid, textMessage) {
+  const cleanText = textMessage.trim();
+  if (!cleanText) return;
 
-    if (body.event !== 'messages.upsert' && body.event !== 'MESSAGES_UPSERT') {
-      return res.status(200).send({ status: 'ignored_event' });
+  let session = userStates.get(remoteJid) || { mode: 'INICIAL' };
+
+  // Comando universal para voltar ao menu
+  if (cleanText === '#' || cleanText.toLowerCase() === '#menu') {
+    userStates.set(remoteJid, { mode: 'INICIAL' });
+    const menuInicial = 
+      `🤖 *Olá! Seja bem-vindo(a).*\n\nComo deseja ser atendido?\n\n` +
+      `1️⃣ - Empresa (Exige dados e menu obrigatório)\n` +
+      `2️⃣ - Particular (Atendimento livre com IA)`;
+    await sock.sendMessage(remoteJid, { text: menuInicial });
+    return;
+  }
+
+  // 1. Modo PARTICULAR -> Conversa livre com IA
+  if (session.mode === 'PARTICULAR') {
+    const aiResponse = await askAI(cleanText);
+    await sock.sendMessage(remoteJid, { text: aiResponse });
+    return;
+  }
+
+  // 2. Modo COLETANDO_DADOS (Empresa)
+  if (session.mode === 'COLETANDO_DADOS') {
+    session.dadosEmpresa = cleanText;
+    session.mode = 'EMPRESA_MENU';
+    userStates.set(remoteJid, session);
+
+    const menuEmpresa = 
+      `${config.sucessoDadosMsg}\n\n${config.menuEmpresaHeader}\n` +
+      `${config.item1}\n${config.item2}\n${config.item3}\n\n` +
+      `*(Digite o número da opção desejada ou # para voltar)*`;
+    
+    await sock.sendMessage(remoteJid, { text: menuEmpresa });
+    return;
+  }
+
+  // 3. Modo EMPRESA_MENU
+  if (session.mode === 'EMPRESA_MENU') {
+    if (cleanText.toLowerCase() === config.configTrigger.toLowerCase()) {
+      await sock.sendMessage(remoteJid, { text: config.configResp + "\n\n*(Digite # para voltar)*" });
+      return;
     }
 
-    const messageData = body.data;
-    if (!messageData || !messageData.message) {
-      return res.status(200).send({ status: 'no_message_data' });
+    if (cleanText === '1') {
+      await sock.sendMessage(remoteJid, { text: config.resp1.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar)*" });
+    } else if (cleanText === '2') {
+      await sock.sendMessage(remoteJid, { text: config.resp2.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar)*" });
+    } else if (cleanText === '3') {
+      await sock.sendMessage(remoteJid, { text: config.resp3.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar)*" });
+    } else {
+      const menuEmpresa = 
+        `${config.menuEmpresaHeader}\n` +
+        `${config.item1}\n${config.item2}\n${config.item3}\n\n` +
+        `⚠️ *(Digite # para voltar ao início)*`;
+
+      await sock.sendMessage(remoteJid, { text: `${config.falhaMsg}\n\n` + menuEmpresa });
     }
+    return;
+  }
 
-    if (messageData.key && messageData.key.fromMe) {
-      return res.status(200).send({ status: 'ignored_from_me' });
-    }
-
-    const remoteJid = messageData.key.remoteJid;
-    const msgContent = messageData.message;
-    const textMessage = 
-      msgContent.conversation || 
-      msgContent.extendedTextMessage?.text || 
-      '';
-
-    const cleanText = textMessage.trim();
-    if (!cleanText) return res.status(200).send({ status: 'empty_text' });
-
-    let session = userStates.get(remoteJid) || { mode: 'INICIAL' };
-
-    // Comando universal para voltar ao menu
-    if (cleanText === '#' || cleanText.toLowerCase() === '#menu') {
-      userStates.set(remoteJid, { mode: 'INICIAL' });
+  // 4. Modo INICIAL
+  if (session.mode === 'INICIAL') {
+    if (cleanText === '1') {
+      session.mode = 'COLETANDO_DADOS';
+      userStates.set(remoteJid, session);
+      await sock.sendMessage(remoteJid, { text: `${config.empresaHeader}\n\n${config.solicitarDadosMsg}` });
+    } 
+    else if (cleanText === '2') {
+      session.mode = 'PARTICULAR';
+      userStates.set(remoteJid, session);
+      await sock.sendMessage(remoteJid, { text: config.particularIntro });
+    } 
+    else {
       const menuInicial = 
-        `🤖 *Olá! Seja bem-vindo(a).*\n\nComo deseja ser atendido?\n\n` +
+        `❌ *Opção inválida!*\n\nEscolha como deseja ser atendido:\n\n` +
         `1️⃣ - Empresa (Exige dados e menu obrigatório)\n` +
         `2️⃣ - Particular (Atendimento livre com IA)`;
-      await sendWhatsAppMessage(remoteJid, menuInicial);
-      return res.status(200).send({ status: 'success', action: 'returned_to_menu' });
+      await sock.sendMessage(remoteJid, { text: menuInicial });
     }
-
-    // 1. Modo PARTICULAR -> Conversa livre com IA
-    if (session.mode === 'PARTICULAR') {
-      const aiResponse = await askAI(cleanText);
-      await sendWhatsAppMessage(remoteJid, aiResponse);
-      return res.status(200).send({ status: 'success', action: 'ai_response' });
-    }
-
-    // 2. Modo COLETANDO_DADOS (Empresa) -> Obrigatório informar dados antes de entrar no menu
-    if (session.mode === 'COLETANDO_DADOS') {
-      session.dadosEmpresa = cleanText;
-      session.mode = 'EMPRESA_MENU';
-      userStates.set(remoteJid, session);
-
-      const menuEmpresa = 
-        `${config.sucessoDadosMsg}\n\n${config.menuEmpresaHeader}\n` +
-        `${config.item1}\n${config.item2}\n${config.item3}\n\n` +
-        `*(Digite o número da opção desejada ou # para voltar)*`;
-      
-      await sendWhatsAppMessage(remoteJid, menuEmpresa);
-      return res.status(200).send({ status: 'success', action: 'data_collected' });
-    }
-
-    // 3. Modo EMPRESA_MENU -> Menu estrito com itens 1 a 3 obrigatórios + Falha + Config
-    if (session.mode === 'EMPRESA_MENU') {
-      if (cleanText.toLowerCase() === config.configTrigger.toLowerCase()) {
-        await sendWhatsAppMessage(remoteJid, config.configResp + "\n\n*(Digite # para voltar)*");
-        return res.status(200).send({ status: 'success', action: 'config_triggered' });
-      }
-
-      if (cleanText === '1') {
-        await sendWhatsAppMessage(remoteJid, config.resp1.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar)*");
-      } else if (cleanText === '2') {
-        await sendWhatsAppMessage(remoteJid, config.resp2.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar)*");
-      } else if (cleanText === '3') {
-        await sendWhatsAppMessage(remoteJid, config.resp3.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar)*");
-      } else {
-        const menuEmpresa = 
-          `${config.menuEmpresaHeader}\n` +
-          `${config.item1}\n${config.item2}\n${config.item3}\n\n` +
-          `⚠️ *(Digite # para voltar ao início)*`;
-
-        await sendWhatsAppMessage(remoteJid, `${config.falhaMsg}\n\n` + menuEmpresa);
-      }
-      return res.status(200).send({ status: 'success', action: 'menu_empresa' });
-    }
-
-    // 4. Modo INICIAL (Escolha Empresa vs. Particular)
-    if (session.mode === 'INICIAL') {
-      if (cleanText === '1') {
-        session.mode = 'COLETANDO_DADOS';
-        userStates.set(remoteJid, session);
-        await sendWhatsAppMessage(remoteJid, `${config.empresaHeader}\n\n${config.solicitarDadosMsg}`);
-      } 
-      else if (cleanText === '2') {
-        session.mode = 'PARTICULAR';
-        userStates.set(remoteJid, session);
-        await sendWhatsAppMessage(remoteJid, config.particularIntro);
-      } 
-      else {
-        const menuInicial = 
-          `❌ *Opção inválida!*\n\nEscolha como deseja ser atendido:\n\n` +
-          `1️⃣ - Empresa (Exige dados e menu obrigatório)\n` +
-          `2️⃣ - Particular (Atendimento livre com IA)`;
-        await sendWhatsAppMessage(remoteJid, menuInicial);
-      }
-      return res.status(200).send({ status: 'success', action: 'initial_choice' });
-    }
-
-    res.status(200).send({ status: 'success' });
-  } catch (err) {
-    console.error('[ERRO NO WEBHOOK]:', err);
-    res.status(500).send({ error: err.message });
   }
-});
+}
+
+async function startWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState(SESSIONS_DIR);
+
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+    logger: pino({ level: 'silent' })
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (connection === 'close') {
+      const shouldReconnect = (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut);
+      whatsappStatus = 'Conexão fechada. Reconectando...';
+      console.log('[CONEXÃO] Fechada. Reconectando:', shouldReconnect);
+      if (shouldReconnect) {
+        startWhatsApp();
+      } else {
+        whatsappStatus = 'Deslogado. É necessário um novo pareamento.';
+      }
+    } else if (connection === 'open') {
+      whatsappStatus = 'Conectado com sucesso ao WhatsApp! 🟢';
+      console.log('[CONEXÃO] WhatsApp conectado com sucesso!');
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue;
+
+      const remoteJid = msg.key.remoteJid;
+      if (remoteJid.endsWith('@g.us')) continue;
+
+      const textMessage = 
+        msg.message.conversation || 
+        msg.message.extendedTextMessage?.text || 
+        '';
+
+      if (!textMessage) continue;
+
+      console.log(`[MENSAGEM RECEBIDA] De ${remoteJid}: "${textMessage}"`);
+      await handleIncomingMessage(remoteJid, textMessage);
+    }
+  });
+}
 
 app.get('/', (req, res) => {
-  res.send({ status: 'online', service: 'Atendimento WhatsApp Webhook (Evolution API)' });
+  res.send(`
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta http-equiv="refresh" content="5">
+        <title>Atendimento WhatsApp - Status</title>
+        <style>
+          body { font-family: sans-serif; background: #0f172a; color: #fff; text-align: center; padding-top: 80px; }
+          .box { background: #1e293b; display: inline-block; padding: 30px 60px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+          h1 { color: #38bdf8; font-size: 1.4em; }
+          p { color: ${whatsappStatus.includes('Conectado') ? '#22c55e' : '#fbbf24'}; font-weight: bold; font-size: 1.1em; }
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <h1>🤖 Atendimento WhatsApp Online</h1>
+          <p>${whatsappStatus}</p>
+        </div>
+      </body>
+    </html>
+  `);
 });
 
 app.listen(PORT, () => {
-  console.log(`Webhook rodando na porta ${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
+  startWhatsApp();
 });
