@@ -14,13 +14,25 @@ const userStates = new Map();
 let latestQR = '';
 let connectionStatus = 'Aguardando inicialização...';
 
-// Configurações personalizáveis do Bot
-let botConfig = {
-  menuTitle: "🤖 *Olá! Seja bem-vindo(a) ao nosso atendimento automático.*",
-  opcao1Text: "📦 *Nossos Produtos e Preços:*\\nTemos soluções completas para o seu negócio.\\n- Plano Starter: R$ 97/mês\\n- Plano Pro: R$ 197/mês",
-  opcao2Text: "🛠️ *Suporte Técnico:*\\nNosso horário de atendimento é de Segunda a Sexta, das 09h às 18h.",
-  opcao3Text: "👤 *Atendimento Humano / Especialista Ativado!*\\nA partir de agora você está conversando com um atendente."
+// Menu Dinâmico Configurável via Painel Web
+// Cada opção possui: id (número), titulo (botão do menu), resposta (texto enviado)
+let menuConfig = {
+  header: "🤖 *Olá! Seja bem-vindo(a) ao nosso atendimento automático.*",
+  options: [
+    { id: "1", titulo: "Produtos e Preços", resposta: "📦 *Nossos Produtos e Preços:*\\nTemos soluções completas para o seu negócio.\\n- Plano Starter: R$ 97/mês\\n- Plano Pro: R$ 197/mês" },
+    { id: "2", titulo: "Suporte Técnico", resposta: "🛠️ *Suporte Técnico:*\\nNosso horário de atendimento é de Segunda a Sexta, das 09h às 18h." },
+    { id: "3", titulo: "Falar com Atendente (Humano / IA)", resposta: "👤 *Atendimento Humano Ativado!*\\nA partir de agora você está conversando com nossa equipe." }
+  ]
 };
+
+// Função para montar o texto formatado do menu com base nas opções cadastradas
+function getFormattedMenu() {
+  let text = `${menuConfig.header}\n\n*Escolha uma opção digitando o número correspondente:*`;
+  menuConfig.options.forEach(opt => {
+    text += `\n${opt.id}️⃣ - ${opt.titulo}`;
+  });
+  return text;
+}
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
@@ -73,8 +85,7 @@ async function startWhatsApp() {
 
       if (cleanText === '#' || cleanText.toLowerCase() === '#menu') {
         userStates.set(remoteJid, 'MENU');
-        const fullMenu = `${botConfig.menuTitle}\n\nEscolha uma opção:\n1️⃣ - Produtos e Preços\n2️⃣ - Suporte Técnico\n3️⃣ - Falar com Atendente`;
-        await sock.sendMessage(remoteJid, { text: `🔄 Retornando...\n\n` + fullMenu });
+        await sock.sendMessage(remoteJid, { text: `🔄 Retornando ao menu...\n\n` + getFormattedMenu() });
         continue;
       }
 
@@ -83,24 +94,24 @@ async function startWhatsApp() {
       }
 
       if (currentState === 'MENU') {
-        const fullMenu = `${botConfig.menuTitle}\n\nEscolha uma opção:\n1️⃣ - Produtos e Preços\n2️⃣ - Suporte Técnico\n3️⃣ - Falar com Atendente`;
+        const matchedOption = menuConfig.options.find(opt => opt.id === cleanText);
 
-        if (cleanText === '1') {
-          await sock.sendMessage(remoteJid, { text: botConfig.opcao1Text.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar ao menu)*" });
-        } else if (cleanText === '2') {
-          await sock.sendMessage(remoteJid, { text: botConfig.opcao2Text.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar ao menu)*" });
-        } else if (cleanText === '3') {
-          userStates.set(remoteJid, 'ATENDIMENTO_HUMANO');
-          await sock.sendMessage(remoteJid, { text: botConfig.opcao3Text.replace(/\\n/g, '\n') });
+        if (matchedOption) {
+          // Se for a última opção ou se configurar explicitamente como humano (ex: ID 3 ou última)
+          if (matchedOption.id === '3' || matchedOption === menuConfig.options[menuConfig.options.length - 1]) {
+            userStates.set(remoteJid, 'ATENDIMENTO_HUMANO');
+          }
+          await sock.sendMessage(remoteJid, { text: matchedOption.resposta.replace(/\\n/g, '\n') + "\n\n*(Digite # para voltar ao menu)*" });
         } else {
-          await sock.sendMessage(remoteJid, { text: `⚠️ *Opção inválida!*\n\nDigite apenas 1, 2 ou 3:\n\n` + fullMenu });
+          // BLOQUEIO RIGOROSO DE CONVERSA LIVRE
+          await sock.sendMessage(remoteJid, { text: `⚠️ *Opção inválida!*\n\nPor favor, digite apenas o número de uma das opções válidas:\n\n` + getFormattedMenu() });
         }
       }
     }
   });
 }
 
-// Rota do Painel Web de Configuração e QR Code
+// Painel Web Dinâmico para Gerenciar Opções do Menu
 app.get('/', async (req, res) => {
   let qrSection = '<p style="color: #fbbf24;">Gerando QR Code...</p>';
 
@@ -118,48 +129,60 @@ app.get('/', async (req, res) => {
     qrSection = '<h3 style="color: #22c55e;">✅ WhatsApp Conectado com Sucesso!</h3>';
   }
 
+  let optionsHtml = '';
+  menuConfig.options.forEach((opt, index) => {
+    optionsHtml += `
+      <div style="background: #334155; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+        <h4>Opção ${index + 1}</h4>
+        <label>Número/ID (ex: 1, 2, 4...):</label>
+        <input type="text" name="id_${index}" value="${opt.id}" style="width: 100%; background: #0f172a; color: #fff; border: 1px solid #475569; padding: 8px; border-radius: 4px; margin-top: 5px;" />
+        
+        <label style="margin-top: 10px;">Título do Botão:</label>
+        <input type="text" name="titulo_${index}" value="${opt.titulo}" style="width: 100%; background: #0f172a; color: #fff; border: 1px solid #475569; padding: 8px; border-radius: 4px; margin-top: 5px;" />
+
+        <label style="margin-top: 10px;">Texto de Resposta:</label>
+        <textarea name="resposta_${index}" style="width: 100%; height: 70px; background: #0f172a; color: #fff; border: 1px solid #475569; padding: 8px; border-radius: 4px; margin-top: 5px;">${opt.resposta}</textarea>
+      </div>
+    `;
+  });
+
   res.send(`
     <html>
       <head>
-        <title>Painel de Controle - Bot WhatsApp</title>
+        <title>Painel Dinâmico - Menu WhatsApp</title>
         <meta charset="utf-8">
         <style>
           body { font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
-          .container { max-width: 700px; margin: 0 auto; background: #1e293b; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+          .container { max-width: 750px; margin: 0 auto; background: #1e293b; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
           h1 { color: #38bdf8; text-align: center; }
           .status-box { background: #334155; padding: 15px; border-radius: 8px; text-align: center; font-weight: bold; margin-bottom: 25px; }
-          label { display: block; margin-top: 15px; color: #cbd5e1; font-weight: bold; }
-          textarea { width: 100%; height: 80px; background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: 6px; padding: 10px; margin-top: 5px; font-family: sans-serif; }
-          button { background: #2563eb; color: white; border: none; padding: 12px 20px; font-size: 1em; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; margin-top: 25px; }
+          label { display: block; color: #cbd5e1; font-weight: bold; font-size: 0.9em; }
+          button { background: #2563eb; color: white; border: none; padding: 12px 20px; font-size: 1em; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; margin-top: 20px; }
           button:hover { background: #1d4ed8; }
-          .qr-container { text-align: center; margin-top: 25px; background: #334155; padding: 20px; border-radius: 8px; }
+          .btn-add { background: #10b981; margin-bottom: 20px; }
+          .btn-add:hover { background: #059669; }
+          .qr-container { text-align: center; margin-bottom: 25px; background: #334155; padding: 20px; border-radius: 8px; }
+          textarea { font-family: sans-serif; }
         </style>
       </head>
       <body>
         <div class="container">
-          <h1>⚙️ Painel de Atendimento WhatsApp</h1>
+          <h1>📋 Gerenciador de Menu Dinâmico</h1>
           <div class="status-box">Status: ${connectionStatus}</div>
 
           <div class="qr-container">
             ${qrSection}
           </div>
 
-          <form action="/save" method="POST" style="margin-top: 30px;">
-            <h3>🛠️ Customizar Mensagens do Menu</h3>
-            
-            <label>Título / Mensagem Inicial do Menu:</label>
-            <textarea name="menuTitle">${botConfig.menuTitle}</textarea>
+          <form action="/save" method="POST">
+            <h3>⚙️ Cabeçalho do Menu</h3>
+            <textarea name="header" style="width: 100%; height: 60px; background: #0f172a; color: #fff; border: 1px solid #475569; padding: 8px; border-radius: 4px; margin-bottom: 20px;">${menuConfig.header}</textarea>
 
-            <label>Resposta da Opção 1 (Produtos e Preços):</label>
-            <textarea name="opcao1Text">${botConfig.opcao1Text}</textarea>
+            <h3>📑 Opções do Menu (Editar Existentes ou Adicionar Novas)</h3>
+            ${optionsHtml}
 
-            <label>Resposta da Opção 2 (Suporte Técnico):</label>
-            <textarea name="opcao2Text">${botConfig.opcao2Text}</textarea>
-
-            <label>Resposta da Opção 3 (Falar com Atendente):</label>
-            <textarea name="opcao3Text">${botConfig.opcao3Text}</textarea>
-
-            <button type="submit">Salvar Alterações</button>
+            <button type="submit" class="btn-add" formaction="/add-option">➕ Adicionar Nova Opção ao Menu</button>
+            <button type="submit">💾 Salvar Alterações e Atualizar Bot</button>
           </form>
         </div>
       </body>
@@ -167,12 +190,50 @@ app.get('/', async (req, res) => {
   `);
 });
 
-// Rota para salvar configurações do painel
+// Salvar alterações do menu
 app.post('/save', (req, res) => {
-  botConfig.menuTitle = req.body.menuTitle || botConfig.menuTitle;
-  botConfig.opcao1Text = req.body.opcao1Text || botConfig.opcao1Text;
-  botConfig.opcao2Text = req.body.opcao2Text || botConfig.opcao2Text;
-  botConfig.opcao3Text = req.body.opcao3Text || botConfig.opcao3Text;
+  menuConfig.header = req.body.header || menuConfig.header;
+  
+  let newOptions = [];
+  let i = 0;
+  while (req.body[`id_${i}`] !== undefined) {
+    newOptions.push({
+      id: req.body[`id_${i}`],
+      titulo: req.body[`titulo_${i}`],
+      resposta: req.body[`resposta_${i}`]
+    });
+    i++;
+  }
+  if (newOptions.length > 0) {
+    menuConfig.options = newOptions;
+  }
+  res.redirect('/');
+});
+
+// Adicionar nova opção dinamicamente
+app.post('/add-option', (req, res) => {
+  menuConfig.header = req.body.header || menuConfig.header;
+  
+  let newOptions = [];
+  let i = 0;
+  while (req.body[`id_${i}`] !== undefined) {
+    newOptions.push({
+      id: req.body[`id_${i}`],
+      titulo: req.body[`titulo_${i}`],
+      resposta: req.body[`resposta_${i}`]
+    });
+    i++;
+  }
+
+  // Adiciona uma nova opção padrão
+  const nextId = (newOptions.length + 1).toString();
+  newOptions.push({
+    id: nextId,
+    titulo: "Novo Assunto",
+    resposta: "Digite a resposta para este novo assunto aqui."
+  });
+
+  menuConfig.options = newOptions;
   res.redirect('/');
 });
 
