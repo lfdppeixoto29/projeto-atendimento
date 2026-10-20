@@ -1,12 +1,16 @@
 {
   "name": "projeto-atendimento-whatsapp",
   "version": "1.0.0",
-  "description": "Bot WhatsApp Unificado com Menu Estrito para Railway",
+  "description": "Bot WhatsApp com Painel de Configuração e Menu Estrito",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "@whiskeysockets/baileys": "^6.7.13",
+    "@hapi/boom": "^10.0.1",
+    "qrcode": "^1.5.3",
+    "pino": "^9.0.0"
   }
 }
